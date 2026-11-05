@@ -64,24 +64,24 @@
   */
 
 #ifndef DSY_USB_DESC_MFR_STR
-#define DSY_USB_DESC_MFR_STR "Electrosmith"
+#define DSY_USB_DESC_MFR_STR "Synthux"
 #endif
 #ifndef DSY_USB_DESC_PRODUCT_STR
-#define DSY_USB_DESC_PRODUCT_STR "Daisy Bootloader"
+#define DSY_USB_DESC_PRODUCT_STR "Audrey III"
 #endif
 
 #define USBD_VID     1155
 #define USBD_LANGID_STRING     1033
-//#define USBD_MANUFACTURER_STRING     "Electrosmith"
+//#define USBD_MANUFACTURER_STRING     "Synthux"
 #define USBD_MANUFACTURER_STRING     DSY_USB_DESC_MFR_STR
 #define USBD_PID_FS     57105
-//#define USBD_PRODUCT_STRING_FS     "Daisy Bootloader"
+//#define USBD_PRODUCT_STRING_FS     "Audrey III"
 #define USBD_PRODUCT_STRING_FS     DSY_USB_DESC_PRODUCT_STR
 #define USBD_CONFIGURATION_STRING_FS     "DFU Config"
 #define USBD_INTERFACE_STRING_FS     "DFU Interface"
 
 #define USBD_PID_HS     57105
-//#define USBD_PRODUCT_STRING_HS     "Daisy Bootloader"
+//#define USBD_PRODUCT_STRING_HS     "Audrey III"
 #define USBD_PRODUCT_STRING_HS     (DSY_USB_DESC_PRODUCT_STR)
 #define USBD_CONFIGURATION_STRING_HS     "DFU Config"
 #define USBD_INTERFACE_STRING_HS     "DFU Interface"
