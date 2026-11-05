@@ -1,8 +1,9 @@
 # Audrey bootloader
 
-USB DFU bootloader for the Audrey integrated board (STM32H743VIT6). Status: **proposed, not built or
-tested**. It is based on this repo's Daisy bootloader and replaces the Daisy-only `bootloader.bin`
-in Audrey-III, which targets the Daisy Seed2 DFM (STM32H750 with QSPI).
+USB DFU bootloader for the Audrey integrated board (STM32H743VIT6), in [audrey/](../audrey). It is
+based on this repo's Daisy bootloader and takes over from the Daisy-only `bootloader.bin` in
+Audrey-III for that project's integrated build. See [Test status](#acceptance-tests) for what has been
+run on the board.
 
 Sibling project: `../_Audrey_/Audrey-III` (paths below starting with `src/` or `app.cpp` are in it).
 
@@ -73,18 +74,25 @@ Reset_Handler
 - **Jump:** interrupts off, set `VTOR` and `MSP`, branch. The app's own USB clock check passes
   because USB was never started on this path.
 
-**Bootloader mode** copies code to RAM, starts clocks at 400 MHz (no boost), then starts LEDs and
-USB. Clock start-up uses the crystal check and HSI fallback from `integrated_seed.cpp`, so a failed
+A fault in this flow, such as an ECC error reading the app's vectors, sets the boot request and resets,
+so it counts as no valid app.
+
+**Bootloader mode** copies code to RAM, starts clocks at 400 MHz (no boost) with the data cache off,
+then starts LEDs and USB. Clock start-up uses the crystal check and HSI fallback from `integrated_seed.cpp`, so a failed
 crystal doesn't leave the bootloader dead. It also drives `AMP_EN` and `XSMT` low.
 
 ## Running from RAM
 
 Code that fetches from bank 1 stalls while bank 1 is erased or programmed, which would stop USB and
-the LEDs. So `.isr_vector`, `.text` and `.rodata` are linked to AXI SRAM, loaded from flash, and
-`VTOR` points to the RAM copy. Only the boot flow above and the copy loop execute from flash.
+the LEDs. So code, read-only data, initial data and libDaisy's vector table are linked to AXI SRAM as
+one block, loaded from flash, and `VTOR` points to the RAM copy. Only a small vector table, the boot
+flow above and the copy loop execute from flash (`.boot_text`).
 
-Sector erases use `HAL_FLASHEx_Erase_IT`, so the main loop keeps running and remains the only place
-that draws LEDs. Flash-word writes are short enough to be blocking.
+Sector erases are started and then polled through the status register, so the main loop keeps running
+and remains the only place that draws LEDs. Flash-word writes are short enough to be blocking.
+
+Flash is driven by register, not through the HAL: `libdaisy.a` is built for STM32H750, whose
+`HAL_FLASH_Program` rejects addresses above its 128 KB of flash.
 
 ## DFU backend
 
@@ -104,22 +112,19 @@ segment counts are limited to two digits:
   This rounds the image size up by less than 4 KB, so the bar is forced to full at commit.
 - The first request in a sector sets that sector's bit in a pending mask. The main loop erases
   pending sectors one at a time. A request for a sector already pending or erased does nothing else.
-- The queue is needed because stock `dfu.cpp` returns an error if a request arrives while busy, and
-  a host can send the next request before a 128 KB erase finishes.
 
 **Write.**
 - Program 32-byte flash words; pad a short final chunk with `0xFF`.
 - Hold back the first 32 bytes of the app in RAM (see Commit).
 - Read back and compare each chunk.
 
-**Status (`bwPollTimeout`).** `MEM_If_GetStatus_FS` runs *before* the request it reports on, and the
-`Add` it receives isn't the erase address. So timeouts depend on queue state:
-- Erase requests report a short timeout.
-- All other requests, including `SET_ADDRESS`, report the worst-case time for the erases still
-  pending, or about 3 ms if none are. `dfu-util` sends `SET_ADDRESS` before every chunk, so it sleeps
-  through the erases before its first write. The middleware can't report busy again on the next poll,
-  so this figure has to be a true worst case. A small upload may therefore sit on plate 6 for several
-  seconds longer than the erase takes.
+**Status.** The DFU class reports `dfuDNBUSY` once per request, for one `bwPollTimeout`. To avoid
+guessing the slowest erase, the bootloader wraps the class's `Setup` handler. While a queued erase or
+write is running, it answers `GETSTATUS` with `dfuDNBUSY` itself, and hosts keep polling, as DFU allows.
+Once the work is done, the class answers as normal. So the host waits as long as the flash really
+takes: about 1 s per sector.
+- The `MEM_If_GetStatus` callback runs *before* the request it reports on, and reports 1 ms.
+- While busy, the poll is 50 ms during an erase and 1 ms during a write.
 - After a failed write or verify, report `errVERIFY` so the host stops with an error. Stock code
   always reports OK.
 
@@ -148,11 +153,21 @@ is owning its TIM3 handle instead of using `TimerHandle` (see libDaisy below).
 |---|---|
 | Data | PC6, TIM3 CH1 |
 | Power | `LED_EN` PD10 high |
-| Frames | 40 LEDs, all sent, at about 50 Hz |
+| Frames | 40 LEDs, all sent, at about 200 Hz (the driver dithers across frames at low levels) |
 | Cap | `SetBrightnessLimit(0.8)`, the integrated board's value |
 
 All 40 are sent so the ring (indexes 8-39) goes dark. WS2812s hold their last colour, so the app's
 ring would otherwise stay lit after a reset into the bootloader.
+
+Power changes must not show:
+- **Power-up:** the LED rail takes about 2 s to discharge, and until then the LEDs remember their last
+  colours and show them when power returns. So black frames go out for 5 ms before `LED_EN` goes high
+  and for 100 ms after. The app's integrated build does the same with 30 ms after. `LED_EN` is driven low
+  from the start, and the LEDs aren't touched until 50 ms after `HAL_Init`, because the app, whose
+  black frames do work, gets there at least 25 ms after start-up.
+- **Before the reset that starts the app:** the chain is sent black, `LED_EN` goes low, and the rail
+  gets 50 ms to fall. A reset would otherwise cut a frame short and float the data line with the LEDs
+  still powered.
 
 Plates in progress order (`kPadLed` in `src/ui/core.ui.h`):
 
@@ -186,22 +201,25 @@ Colour is white and base brightness is 0.5, both as in the old binary. Chain ind
 | `app.cpp` | SW1 3 s calls `EnterBootloader()` instead of `EnterUpdateMode()` |
 | `README.md`, `AUDREY-IV.md`, `specs/` | Update flash instructions |
 
-`EnterBootloader()` must wait for release because resetting with SW1 held starts ROM DFU. `rom_request`
-and `EnterUpdateMode()` can go once nothing uses them.
+`EnterBootloader()` must wait for release because resetting with SW1 held starts ROM DFU.
+`EnterUpdateMode()` and `rom_request` stay for now: the integrated hardware test, outside this tree, may
+still use them.
+
+`bootloader-integrated.bin` in Audrey-III is a copy of `audrey/build/audrey_bootloader.bin`, for
+`make BOARD=integrated program-boot`, as `bootloader.bin` serves the Daisy build. Rebuild and copy it
+when the bootloader changes.
 
 The linker comment about the ROM loader's stack limit still applies, so keep `_estack` as it is.
 
 ## libDaisy
 
-Keep this repo's stock libDaisy submodule (`24be4afe`, upstream `v8.1.0-10`). The bootloader doesn't
+This repo keeps its stock libDaisy submodule (`24be4afe`, upstream `v8.1.0-10`). The bootloader doesn't
 need `bleeptools/libDaisy`, and Audrey-III stays on the fork unchanged. The two are separate binaries
 and share only the flash layout and the boot request word.
 
 The bootloader's own driver copy replaces the one fork API it needs, `TimerHandle::GetHALHandle()`:
 it owns a `TIM_HandleTypeDef` for TIM3 and sets it up with the same HAL calls and values as
-`TimerHandle::Init`. Compiling `ws2812.cpp` against stock headers with `FILEIO_ENABLE_FATFS_READER`
-unset reports only that API plus two `WavPlayer.h` errors caused by the missing define. The stock
-Makefile sets that define, but a compile with it set has not been run yet.
+`TimerHandle::Init`.
 
 Stock also already defines `USBD_SUPPORT_USER_STRING_DESC`, which DFU needs to serve the memory layout
 string. The fork misspells it and would have needed upstream's fix `7651b28c`. Both repos pin the same
@@ -209,15 +227,16 @@ HAL, CMSIS device and USB middleware commits, and the stock submodules need
 `git submodule update --init --recursive` before the first build.
 
 `libdaisy.a` stays built for STM32H750 (same die and register map), as the app's does today, with
-`-DSTM32H743xx` for the bootloader's own files. The stock `bootloader/` target keeps building.
+`-DSTM32H743xx` for the bootloader's own files. The stock `bootloader/` target still builds.
 
 ## Files
 
 ```text
 audrey/
-  Makefile           BOARD target, -DSTM32H743xx, USBD_DFU_VENDOR_EXIT_ENABLED=1, no FatFS
+  Makefile           -DSTM32H743xx, USBD_DFU_VENDOR_EXIT_ENABLED=1, no FatFS
   boot_linker.lds    128 KB flash, code in AXI SRAM, .sram1_bss for the LED DMA buffer
-  startup.c          Vectors and the boot flow above
+  boot_layout.h      App region and boot request word
+  startup.c          Flash vectors and the boot flow above; includes libDaisy's start-up file for RAM
   main.cpp           Clocks, USB, main loop
   dfu_flash.cpp/.h   DFU backend
   led_status.cpp/.h  LED states
@@ -229,11 +248,14 @@ shared/usbd_desc.c   Reused as it is (Synthux / Audrey III)
 ## Flashing
 
 ```sh
-# First time, or recovery: hold SW1 at power-on (ROM DFU)
-dfu-util -a 0 -s 0x08000000:leave -D build/audrey_bootloader.bin -d ,0483:df11
+# First time, or recovery: hold SW1 at power-on (ROM DFU). In Audrey-III:
+make BOARD=integrated program-boot
 
-# App: bootloader mode (SW2 at power-on, or SW1 for 3 s in the app)
-dfu-util -a 0 -s 0x08020000:leave -D build-integrated-nodebug/Audrey-Integrated.bin -d ,0483:df11
+# App: bootloader mode (SW2 at power-on, or SW1 for 3 s in the app). In Audrey-III:
+make BOARD=integrated program-dfu
+
+# With an ST-Link: the bootloader, in audrey/
+make program
 ```
 
 The ROM loader and this bootloader share USB ID `0483:df11`; the product string tells them apart.
@@ -242,45 +264,40 @@ bootloader mode is rejected.
 
 ## Acceptance tests
 
-Run on pilot board 1.
+Run on the pilot board. "Partial" means the logic was exercised over SWD or USB, but the button or the
+LEDs weren't observed.
 
-| # | Test | Expected |
-|---|---|---|
-| T1 | Blank app region, power on | Bootloader mode, idle glow |
-| T2 | Valid app, power on | App starts, with no glow |
-| T3 | SW2 held at power-on | Idle glow; still running after 10 minutes |
-| T4 | SW1 held 3 s in app, then released | Idle glow after release |
-| T5 | SW1 held at power-on | ROM DFU appears |
-| T6 | Upload the app with `dfu-util` 0.11 | Plate 6 during erase, smooth fill to all six, app starts |
-| T7 | Read the app region back after an upload | Matches the file |
-| T8 | Write to `0x08000000` in bootloader mode | Rejected; bootloader still boots |
-| T9 | Unplug USB mid-erase and mid-write, then power on | Bootloader mode, and a retry succeeds |
-| T10 | Stop the host mid-upload | Idle glow after 5 s, and a retry succeeds |
-| T11 | Upload without `:leave`, then power cycle | Bootloader mode |
-| T12 | Upload an image over 512 KB (3+ sector erases queued) | No USB stall or `dfu-util` error |
-| T13 | Enter from a running app with the ring lit | Ring goes dark |
-| T14 | Build bootloader | Under 128 KB |
+| # | Test | Expected | Status |
+|---|---|---|---|
+| T1 | Blank app region, power on | Bootloader mode, idle glow | Partial: stays in bootloader; glow not observed |
+| T2 | Valid app, power on | App starts, with no glow | Partial: app starts after reset; no power cycle, glow not observed |
+| T3 | SW2 held at power-on | Idle glow; still running after 10 minutes | Not run |
+| T4 | SW1 held 3 s in app, then released | Idle glow after release | Partial: request word plus reset enters the bootloader; button not pressed |
+| T5 | SW1 held at power-on | ROM DFU appears | Not run |
+| T6 | Upload the app with `dfu-util` 0.11 | Plate 6 during erase, smooth fill to all six, app starts | Partial: 6 of 6 uploads verified and started; LEDs not observed |
+| T7 | Read the app region back after an upload | Matches the file | Pass, over SWD |
+| T8 | Write to `0x08000000` in bootloader mode | Rejected; bootloader still boots | Pass |
+| T9 | Unplug USB mid-erase and mid-write, then power on | Bootloader mode, and a retry succeeds | Partial: host killed mid-erase and mid-write, then reset; USB not unplugged |
+| T10 | Stop the host mid-upload | Idle glow after 5 s, and a retry succeeds | Partial: upload state clears, retry succeeds; glow not observed |
+| T11 | Upload without `:leave`, then power cycle | Bootloader mode | Partial: reset rather than power cycle; vectors stay blank |
+| T12 | Upload an image over 512 KB (3+ sector erases queued) | No USB stall or `dfu-util` error | Pass: 612 KB, 10 s (142 KB takes 3 s) |
+| T13 | Enter from a running app with the ring lit | Ring goes dark | Not run |
+| T14 | Build bootloader | Under 128 KB | Pass: 70 KB |
 
-## To verify during implementation
+## Known limits and open items
 
-Confirmed by reading the `dfu-util` 0.11 source (`dfuse.c`, `dfuse_mem.c`) and the fork's `usbd_dfu.c`,
-but not yet run on hardware:
-
-- `dfu-util` erases every page before its first write, so `expected` is known before writing starts.
-  Other DFU hosts may differ, and only `dfu-util` is in scope.
-- It parses the comma-separated layout string. Its parser has no two-digit limit, so the limit only
-  matters for other hosts.
-- `:leave` sends abort, then a zero-length download, which reaches `LeaveDFU`.
-
-Still open:
-
-- **Worst-case erase time.** The design assumes about 3 s per 128 KB sector, from memory. Check it
-  against DS12110, which couldn't be downloaded for this review, and measure it on the board.
+- **Host support:** only `dfu-util` is tested. It erases every page before its first write, so `expected`
+  is known before writing starts; other DFU hosts may differ.
+- **Retry straight after a killed host:** if a host dies during an erase, a new one that starts within
+  about a second per queued sector gets a USB error, because it sees `dfuDNBUSY` and sends its next
+  request too early. Nothing is harmed, and a retry after the erase ends works.
+- **Failure on the last chunk:** a verify failure is reported on the next request. After the final chunk
+  there isn't one, so `dfu-util` reports success, while the device shows the red blink and doesn't start
+  the image.
 - **No reset button.** The docs show none, but the integrated board's schematic wasn't available for
   this review.
 
-## Choices to confirm
+## Differences from the old binary
 
-- **Plate 6 lit at 0%:** the old binary showed nothing during erase. This follows your "0% & erase".
-- **Failed state:** the red blink is new, since the old binary showed nothing for errors.
-- **5 s stall timeout:** returning to idle during an upload is also new.
+- Plate 6 is lit at 0% and during erase; the old binary showed nothing.
+- The red blink for failures and the 5 s return to idle are new.
