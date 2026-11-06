@@ -44,10 +44,18 @@ constexpr uint8_t kStateDnBusy  = 0x04; // dfuDNBUSY
 constexpr uint16_t kMediaOk   = USBD_OK;
 constexpr uint16_t kMediaFail = USBD_FAIL;
 
+// Laid out like a Daisy, which flash.daisy.audio insists on: the first writable region
+// must start at 0x90000000, and it uploads to 0x90040000. That first region is the
+// Daisy's reserved QSPI and is refused here (see ToFlash).
+//
 // Virtual 4 KB pages, so erase requests give the image size to within 4 KB although
 // real sectors are 128 KB. Counts are kept to two digits for DfuSe hosts.
-#define AUDREY_FLASH_LAYOUT "@Flash /0x08020000/99*4Kg,99*4Kg,26*4Kg"
+#define AUDREY_FLASH_LAYOUT                                                 \
+    "@Flash /0x90000000/64*4Kg/0x90040000/99*4Kg/0x900A3000/99*4Kg"         \
+    "/0x90106000/26*4Kg"
 static_assert(99 + 99 + 26 == kNumPages, "layout string doesn't match the app region");
+static_assert(AUDREY_DFU_APP_BASE + 99 * kVirtualPage == 0x900A3000u, "layout string");
+static_assert(AUDREY_DFU_APP_BASE + 198 * kVirtualPage == 0x90106000u, "layout string");
 
 // Written by the USB interrupt, read and cleared by the main loop
 volatile uint32_t pending_sectors = 0; // erase queued or running
@@ -78,10 +86,14 @@ __attribute__((aligned(4))) uint8_t held_word[kFlashWord];
 // Largest chunk, rounded up to whole flash words
 __attribute__((aligned(4))) uint8_t chunk[USBD_DFU_XFER_SIZE + kFlashWord];
 
-bool InAppRegion(uint32_t addr, uint32_t len)
+// From the address a DFU host uses to the flash address. False outside the app region.
+bool ToFlash(uint32_t dfu_addr, uint32_t len, uint32_t* flash_addr)
 {
-    return addr >= AUDREY_APP_BASE && addr < AUDREY_APP_END
-           && len <= AUDREY_APP_END - addr;
+    if(dfu_addr < AUDREY_DFU_APP_BASE || dfu_addr - AUDREY_DFU_APP_BASE >= kAppSize
+       || len > kAppSize - (dfu_addr - AUDREY_DFU_APP_BASE))
+        return false;
+    *flash_addr = dfu_addr - AUDREY_DFU_APP_BASE + AUDREY_APP_BASE;
+    return true;
 }
 
 uint32_t SectorOf(uint32_t addr)
@@ -290,7 +302,8 @@ extern "C"
 
     static uint16_t MEM_If_Erase(uint32_t add)
     {
-        if(!InAppRegion(add, 1) || write_pending)
+        uint32_t addr;
+        if(!ToFlash(add, 1, &addr) || write_pending)
             return kMediaFail;
 
         // A new upload unless the last one is still erasing. After writes the flash
@@ -299,14 +312,14 @@ extern "C"
             StartUpload();
         deadline_ms = HAL_GetTick() + kStallMs;
 
-        const uint32_t page = (add - AUDREY_APP_BASE) / kVirtualPage;
+        const uint32_t page = (addr - AUDREY_APP_BASE) / kVirtualPage;
         if(!(page_bits[page / 32] & (1u << (page % 32))))
         {
             page_bits[page / 32] |= 1u << (page % 32);
             expected = expected + kVirtualPage;
         }
 
-        const uint32_t bit = 1u << SectorOf(add);
+        const uint32_t bit = 1u << SectorOf(addr);
         if(!((pending_sectors | erased_sectors) & bit))
             pending_sectors = pending_sectors | bit;
         return kMediaOk;
@@ -314,12 +327,13 @@ extern "C"
 
     static uint16_t MEM_If_Write(uint8_t* src, uint8_t* dest, uint32_t len)
     {
-        const uint32_t addr = reinterpret_cast<uint32_t>(dest);
+        uint32_t addr;
         // Writes are always to erased flash: a host that skips the erase can't reach
         // already-programmed flash words. A host that ignores busy is refused here.
         if(failed || write_pending || pending_sectors != 0 || len == 0
-           || len > USBD_DFU_XFER_SIZE || addr % kFlashWord != 0
-           || !InAppRegion(addr, len)
+           || len > USBD_DFU_XFER_SIZE
+           || !ToFlash(reinterpret_cast<uint32_t>(dest), len, &addr)
+           || addr % kFlashWord != 0
            || !(erased_sectors & (1u << SectorOf(addr)))
            || !(erased_sectors & (1u << SectorOf(addr + len - 1))))
             return kMediaFail;
@@ -336,9 +350,9 @@ extern "C"
 
     static uint8_t* MEM_If_Read(uint8_t* src, uint8_t* dest, uint32_t len)
     {
-        const uint32_t addr = reinterpret_cast<uint32_t>(src);
-        if(InAppRegion(addr, len))
-            std::memcpy(dest, src, len);
+        uint32_t addr;
+        if(ToFlash(reinterpret_cast<uint32_t>(src), len, &addr))
+            std::memcpy(dest, reinterpret_cast<const void*>(addr), len);
         else
             std::memset(dest, 0xFF, len);
         return dest;

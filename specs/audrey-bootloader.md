@@ -98,15 +98,32 @@ Flash is driven by register, not through the HAL: `libdaisy.a` is built for STM3
 
 Starts from `shared/dfu.cpp`, using the internal FS port (PA11/PA12).
 
-**Memory layout string.** Only the app region is exposed, split into virtual 4 KB pages, because
-segment counts are limited to two digits:
+**Memory layout string.** DFU hosts see the device laid out like a Daisy, because
+`flash.daisy.audio` only works with that layout (see below). The app region is split into virtual 4 KB
+pages, with segment counts kept to two digits:
 
 ```text
-@Flash /0x08020000/99*4Kg,99*4Kg,26*4Kg
+@Flash /0x90000000/64*4Kg/0x90040000/99*4Kg/0x900A3000/99*4Kg/0x90106000/26*4Kg
 ```
 
+The host's `0x90040000` is flash `0x08020000`, linearly. The first region is the Daisy's reserved QSPI:
+it's only there to satisfy the uploader, and writes to it are refused.
+
+**What `flash.daisy.audio` requires.** Its source isn't public, so this comes from reading its compiled
+WASM:
+- A DFU interface whose first writable region starts at `0x08000000` (ST's ROM) or `0x90000000` (Daisy
+  bootloader). Anything else gives "Error connecting to device".
+- On a `0x90000000` device, it uploads to `0x90040000`.
+- The file's first word must be `0x20020000`, or it warns "invalid Daisy binary". The app's vector table
+  has that value in its first slot, and its `Reset_Handler` immediately loads the real stack top,
+  `0x2001FFE0`.
+- The file's entry point must be outside the first 128 KB of flash, or it asks for the ST bootloader.
+
+A stock Daisy binary passes these checks but isn't linked for internal flash. It uploads, then fails
+the boot check, so the board stays in the bootloader until a correct image is uploaded.
+
 **Erase.**
-- Reject any address outside `0x08020000-0x08100000`. Mass erase isn't supported; the middleware
+- Reject any address outside the app region (`0x90040000-0x90120000` to the host). Mass erase isn't supported; the middleware
   already rejects it.
 - Each distinct virtual page requested counts toward the expected total (`expected = pages x 4 KB`).
   This rounds the image size up by less than 4 KB, so the bar is forced to full at commit.
@@ -259,8 +276,9 @@ make program
 ```
 
 The ROM loader and this bootloader share USB ID `0483:df11`; the product string tells them apart.
-Existing boards with the app at `0x08000000` need both steps once. Writing to `0x08000000` in
-bootloader mode is rejected.
+Existing boards with the app at `0x08000000` need both steps once. Boards with an earlier version of
+this bootloader, which took uploads at `0x08020000`, need the bootloader step once. In bootloader mode,
+hosts can't reach `0x08000000` at all, and writes to `0x90000000-0x9003FFFF` are refused.
 
 ## Acceptance tests
 
@@ -276,7 +294,7 @@ LEDs weren't observed.
 | T5 | SW1 held at power-on | ROM DFU appears | Not run |
 | T6 | Upload the app with `dfu-util` 0.11 | Plate 6 during erase, smooth fill to all six, app starts | Partial: 6 of 6 uploads verified and started; LEDs not observed |
 | T7 | Read the app region back after an upload | Matches the file | Pass, over SWD |
-| T8 | Write to `0x08000000` in bootloader mode | Rejected; bootloader still boots | Pass |
+| T8 | Write to `0x90000000` in bootloader mode | Rejected; bootloader and app unchanged | Pass |
 | T9 | Unplug USB mid-erase and mid-write, then power on | Bootloader mode, and a retry succeeds | Partial: host killed mid-erase and mid-write, then reset; USB not unplugged |
 | T10 | Stop the host mid-upload | Idle glow after 5 s, and a retry succeeds | Partial: upload state clears, retry succeeds; glow not observed |
 | T11 | Upload without `:leave`, then power cycle | Bootloader mode | Partial: reset rather than power cycle; vectors stay blank |
@@ -286,8 +304,9 @@ LEDs weren't observed.
 
 ## Known limits and open items
 
-- **Host support:** only `dfu-util` is tested. It erases every page before its first write, so `expected`
-  is known before writing starts; other DFU hosts may differ.
+- **Host support:** `dfu-util` is tested on the board, and `flash.daisy.audio` needs testing in a browser.
+  `dfu-util` erases every page before its first write, so `expected` is known before writing starts; other
+  DFU hosts may differ.
 - **Retry straight after a killed host:** if a host dies during an erase, a new one that starts within
   about a second per queued sector gets a USB error, because it sees `dfuDNBUSY` and sends its next
   request too early. Nothing is harmed, and a retry after the erase ends works.

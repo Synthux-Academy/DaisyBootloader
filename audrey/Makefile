@@ -25,7 +25,7 @@ C_INCLUDES = -I. -I../shared \
 	-I$(LIBDAISY_DIR)/Middlewares/ST/STM32_USB_Device_Library/Class/DFU/Inc
 
 # Sent to the DFU class: our LeaveDFU commits the image instead of a direct reset
-C_DEFS = -DUSBD_DFU_VENDOR_EXIT_ENABLED=1 -DUSBD_DFU_APP_DEFAULT_ADD=0x08020000U
+C_DEFS = -DUSBD_DFU_VENDOR_EXIT_ENABLED=1 -DUSBD_DFU_APP_DEFAULT_ADD=0x90040000U
 
 # Bare-metal: there is no loader enforcing W^X on ELF program headers
 ifneq ($(shell arm-none-eabi-ld --help 2>/dev/null | grep -c no-warn-rwx-segments),0)

@@ -10,6 +10,11 @@
 #define AUDREY_APP_END 0x08100000u // end of bank 1
 #define AUDREY_SECTOR_SIZE 0x20000u
 
+// DFU hosts see the app region here, where a Daisy keeps its app in QSPI, because
+// flash.daisy.audio only talks to devices laid out like one. Translated to
+// AUDREY_APP_BASE by dfu_flash.cpp.
+#define AUDREY_DFU_APP_BASE 0x90040000u
+
 // Survives a system reset, not a power cycle. A power cycle leaves a random value:
 // 1 in 2^32 to match.
 #define AUDREY_BOOT_REQUEST_ADDR 0x2001FFF0u
