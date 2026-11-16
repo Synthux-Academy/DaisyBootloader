@@ -23,6 +23,11 @@ static inline volatile uint32_t* BootRequest()
     return (volatile uint32_t*)AUDREY_BOOT_REQUEST_ADDR;
 }
 
+static inline volatile uint32_t* TapFlag()
+{
+    return (volatile uint32_t*)AUDREY_TAP_FLAG_ADDR;
+}
+
 static BOOT_TEXT __attribute__((noreturn)) void SystemReset()
 {
     __DSB();
@@ -48,14 +53,19 @@ static BOOT_TEXT int AppValid()
            && pc >= AUDREY_APP_BASE && pc < AUDREY_APP_END;
 }
 
-// SW2 (Tap, PC3): low = pressed, 10k pull-up on the board. Leaves GPIOC as at reset.
-static BOOT_TEXT int Sw2Held()
+// SW2 (Tap, PC3): low = pressed, 10k pull-up on the board
+static BOOT_TEXT int Sw2Down()
+{
+    return (GPIOC->IDR & GPIO_IDR_ID3) == 0u;
+}
+
+// PC3 as an input, then 10 ms at the 64 MHz reset clock for it to settle
+static BOOT_TEXT void Sw2Init()
 {
     RCC->AHB4ENR |= RCC_AHB4ENR_GPIOCEN;
     (void)RCC->AHB4ENR;
     GPIOC->MODER &= ~GPIO_MODER_MODE3;
 
-    // Let the input settle: 10 ms at the 64 MHz reset clock
     SysTick->LOAD = 640000u - 1u;
     SysTick->VAL  = 0;
     SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
@@ -63,12 +73,80 @@ static BOOT_TEXT int Sw2Held()
     SysTick->CTRL = 0;
     SysTick->LOAD = 0;
     SysTick->VAL  = 0;
+}
 
-    const int held = (GPIOC->IDR & GPIO_IDR_ID3) == 0u;
-
+// Leaves GPIOC as at reset
+static BOOT_TEXT void Sw2Deinit()
+{
     GPIOC->MODER |= GPIO_MODER_MODE3;
     RCC->AHB4ENR &= ~RCC_AHB4ENR_GPIOCEN;
-    return held;
+}
+
+typedef enum
+{
+    kSw2Glitch, // seen down at the first read only: a normal start
+    kSw2Tapped, // held, then let go before AUDREY_TAP_HOLD_MS
+    kSw2Held,   // still down after AUDREY_TAP_HOLD_MS
+} Sw2Hold;
+
+#define BOOT_CLOCK_HZ 64000000u // HSI at reset, HSIDIV 1
+#define BOOT_CYCLES_PER_MS (BOOT_CLOCK_HZ / 1000u)
+// Up for this long counts as let go (contact bounce is shorter)
+#define SW2_RELEASE_MS 20u
+// Down for at least this long counts as a tap (a glitch at the first read doesn't)
+#define SW2_MIN_TAP_MS 50u
+
+// SW2 was down at the first read: how long it stays down, timed with the DWT cycle
+// counter at the reset clock (no tick runs yet), as StartHse in board.cpp does.
+// Returns after SW2_RELEASE_MS of SW2 up, or once it is still down at
+// AUDREY_TAP_HOLD_MS. Leaves the DWT and its trace enable as it found them.
+static BOOT_TEXT Sw2Hold Sw2TimeHold()
+{
+    const uint32_t demcr = CoreDebug->DEMCR;
+    CoreDebug->DEMCR     = demcr | CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->LAR             = 0xC5ACCE55u; // Cortex-M7: unlock the DWT registers
+    const uint32_t ctrl  = DWT->CTRL;
+    DWT->CYCCNT          = 0;
+    DWT->CTRL            = ctrl | DWT_CTRL_CYCCNTENA_Msk;
+
+    const uint32_t hold    = AUDREY_TAP_HOLD_MS * BOOT_CYCLES_PER_MS;
+    const uint32_t release = SW2_RELEASE_MS * BOOT_CYCLES_PER_MS;
+    uint32_t       last_down = 0;
+    uint32_t       up_since  = 0;
+    int            up        = 0;
+    Sw2Hold        result;
+    for(;;)
+    {
+        const uint32_t now = DWT->CYCCNT;
+        if(Sw2Down())
+        {
+            up        = 0;
+            last_down = now;
+            if(now >= hold)
+            {
+                result = kSw2Held;
+                break;
+            }
+        }
+        else
+        {
+            if(!up)
+            {
+                up       = 1;
+                up_since = now;
+            }
+            if(now - up_since >= release)
+            {
+                result = last_down >= SW2_MIN_TAP_MS * BOOT_CYCLES_PER_MS ? kSw2Tapped
+                                                                           : kSw2Glitch;
+                break;
+            }
+        }
+    }
+
+    DWT->CTRL        = ctrl;
+    CoreDebug->DEMCR = demcr;
+    return result;
 }
 
 static BOOT_TEXT __attribute__((noreturn)) void JumpToApp()
@@ -102,11 +180,25 @@ BOOT_TEXT __attribute__((noreturn, used)) void BootFlow()
 {
     const uint32_t request = *BootRequest();
     *BootRequest()         = 0;
+    *TapFlag()             = 0;
 
-    // Evaluate SW2 first so a bootloader entry always gets the same delay
-    const int sw2 = Sw2Held();
-    if(request == AUDREY_BOOT_REQUEST_MAGIC || sw2 || !AppValid())
+    // A normal start reads SW2 once, after the same 10 ms settle as before, so a
+    // bootloader entry always gets the same delay
+    Sw2Init();
+    const int     sw2  = Sw2Down();
+    const int     boot = request == AUDREY_BOOT_REQUEST_MAGIC || !AppValid();
+    Sw2Hold       hold = kSw2Glitch;
+    // Tap held at power-on, with an app to start: let go before 3 s, the app starts
+    // and flips its auto-sleep setting; held 3 s, bootloader mode
+    if(sw2 && !boot)
+        hold = Sw2TimeHold();
+    Sw2Deinit();
+
+    if(boot || hold == kSw2Held)
         RunFromRam();
+    if(hold == kSw2Tapped)
+        *TapFlag() = AUDREY_TAP_FLAG_MAGIC;
+    __DSB();
     JumpToApp();
 }
 

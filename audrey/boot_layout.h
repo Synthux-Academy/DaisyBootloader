@@ -19,3 +19,13 @@
 // 1 in 2^32 to match.
 #define AUDREY_BOOT_REQUEST_ADDR 0x2001FFF0u
 #define AUDREY_BOOT_REQUEST_MAGIC 0xB007DF11u
+
+// Tap (SW2) was held at power-on and let go before AUDREY_TAP_HOLD_MS: the app flips
+// its auto-sleep setting. Next to the boot request word, also above the app's
+// _estack (0x2001FFE0). Written by the boot flow on every start of the app (the
+// magic or 0); the app reads and clears it at start-up.
+#define AUDREY_TAP_FLAG_ADDR 0x2001FFF4u
+#define AUDREY_TAP_FLAG_MAGIC 0x7A9F11B5u
+
+// SW2 held this long at power-on: bootloader mode. Let go earlier: the tap flag.
+#define AUDREY_TAP_HOLD_MS 3000u

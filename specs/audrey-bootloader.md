@@ -12,7 +12,7 @@ Sibling project: `../_Audrey_/Audrey-III` (paths below starting with `src/` or `
 | # | Requirement |
 |---|---|
 | R1 | Runs on the STM32H743VIT6 integrated board and programs the app into internal flash. |
-| R2 | Holding **SW2** (Tap, PC3) at power-on enters the bootloader. |
+| R2 | Holding **SW2** (Tap, PC3) at power-on for **3 s** enters the bootloader. Let go earlier, and the app starts and is told Tap was tapped (it flips its auto-sleep setting). |
 | R3 | Holding **SW1** for 3 s in the running app also enters the bootloader. |
 | R4 | Once entered, the bootloader stays until an upload finishes or power is removed. There is no timeout. |
 | R5 | Otherwise a valid app starts with no visible delay. With no valid app, the bootloader stays active. |
@@ -46,10 +46,16 @@ Bank 1 of the 2 MB flash; sectors are 128 KB.
 | Sectors 1-7 | `0x08020000` | 896 KB | App (currently ~142 KB) |
 | Bank 2 | `0x08100000` | 1 MB | Unused |
 | DTCM word | `0x2001FFF0` | 4 B | Boot request, above the app's `_estack` (`0x2001FFE0`) |
+| DTCM word | `0x2001FFF4` | 4 B | Tap flag (`AUDREY_TAP_FLAG_MAGIC` `0x7A9F11B5`): Tap tapped at power-on |
 
 The boot request word survives a system reset and isn't cleared by either start-up. It follows the
 same convention as `rom_request`: a power cycle leaves a random value, with a 1 in 2^32 chance of a
 false match.
+
+The tap flag is written by the boot flow on every start of the app: the magic after a short Tap hold,
+0 otherwise. The app reads it and clears it at start-up. Both words are above both stacks (a full
+descending stack's first push goes to `0x2001FFDC`) and outside `.data` and `.bss`, so neither start-up
+touches them. The app keeps its auto-sleep setting in bank 2 (`0x08100000`), not here.
 
 The bootloader's `_estack` must also be `0x2001FFE0`. The stock `0x20020000` would put the stack on
 top of the boot request word, and it breaks the ROM loader's stack limit noted in `core.lds`.
@@ -61,11 +67,23 @@ This runs from flash, before clocks, RAM copies or peripherals:
 ```text
 Reset_Handler
   USB or CRS clock enabled (ROM loader jumped here)? -> system reset
-  request = boot request word; clear the word
+  request = boot request word; clear the word; clear the tap flag
   configure PC3 as input, wait about 10 ms, read SW2
-  if request valid, or SW2 low, or app invalid -> bootloader mode
-  otherwise -> restore GPIOC to its reset state, then jump to the app
+  if request valid, or app invalid -> bootloader mode
+  if SW2 low (Tap held):
+    time the hold (DWT cycle counter at the 64 MHz reset clock)
+    still held at 3 s -> bootloader mode
+    let go (up for 20 ms) after at least 50 ms down -> tap flag = magic
+    let go sooner (a glitch at the first read) -> nothing
+  restore GPIOC to its reset state, then jump to the app
 ```
+
+- **Tap split:** a start without Tap reads SW2 once, after the same 10 ms as before, so it gets no added
+  delay. Holding Tap adds the hold time, up to 3 s. SW2 counts as let go after 20 ms up, so contact
+  bounce during the hold isn't a release. A tap needs 50 ms down, so a single low read doesn't flip the
+  app's setting. The DWT and its trace enable are left as they were found. The 3 s run on the HSI
+  (64 MHz, about 1 %).
+- **No valid app:** bootloader mode at once, with or without Tap, as before.
 
 - **USB clock check:** this is the check from `src/hw/core/startup_core.c`. It is needed because
   flashing the bootloader itself through ROM DFU with `:leave` jumps here with USB still running.
@@ -252,7 +270,7 @@ HAL, CMSIS device and USB middleware commits, and the stock submodules need
 audrey/
   Makefile           -DSTM32H743xx, USBD_DFU_VENDOR_EXIT_ENABLED=1, no FatFS
   boot_linker.lds    128 KB flash, code in AXI SRAM, .sram1_bss for the LED DMA buffer
-  boot_layout.h      App region and boot request word
+  boot_layout.h      App region, boot request word, tap flag
   startup.c          Flash vectors and the boot flow above; includes libDaisy's start-up file for RAM
   main.cpp           Clocks, USB, main loop
   dfu_flash.cpp/.h   DFU backend
@@ -268,7 +286,7 @@ shared/usbd_desc.c   Reused as it is (Synthux / Audrey III)
 # First time, or recovery: hold SW1 at power-on (ROM DFU). In Audrey-III:
 make BOARD=integrated program-boot
 
-# App: bootloader mode (SW2 at power-on, or SW1 for 3 s in the app). In Audrey-III:
+# App: bootloader mode (SW2 held 3 s at power-on, or SW1 for 3 s in the app). In Audrey-III:
 make BOARD=integrated program-dfu
 
 # With an ST-Link: the bootloader, in audrey/
@@ -289,7 +307,9 @@ LEDs weren't observed.
 |---|---|---|---|
 | T1 | Blank app region, power on | Bootloader mode, idle glow | Partial: stays in bootloader; glow not observed |
 | T2 | Valid app, power on | App starts, with no glow | Partial: app starts after reset; no power cycle, glow not observed |
-| T3 | SW2 held at power-on | Idle glow; still running after 10 minutes | Not run |
+| T3 | SW2 held at power-on for 4 s | Idle glow; still running after 10 minutes | Not run |
+| T3a | SW2 held at power-on, let go after about 1 s | App starts; its start-up heartbeat shows the flipped auto-sleep setting (Audrey-III `specs/auto-sleep.md` 1.15) | Not run |
+| T3b | Power on without SW2, ten times | App starts with no delay; setting unchanged | Not run |
 | T4 | SW1 held 3 s in app, then released | Idle glow after release | Partial: request word plus reset enters the bootloader; button not pressed |
 | T5 | SW1 held at power-on | ROM DFU appears | Not run |
 | T6 | Upload the app with `dfu-util` 0.11 | Plate 6 during erase, smooth fill to all six, app starts | Partial: 6 of 6 uploads verified and started; LEDs not observed |
@@ -300,7 +320,7 @@ LEDs weren't observed.
 | T11 | Upload without `:leave`, then power cycle | Bootloader mode | Partial: reset rather than power cycle; vectors stay blank |
 | T12 | Upload an image over 512 KB (3+ sector erases queued) | No USB stall or `dfu-util` error | Pass: 612 KB, 10 s (142 KB takes 3 s) |
 | T13 | Enter from a running app with the ring lit | Ring goes dark | Not run |
-| T14 | Build bootloader | Under 128 KB | Pass: 70 KB |
+| T14 | Build bootloader | Under 128 KB | Pass: 72,452 B (16 Nov 2026, GCC 13.2.1 Ubuntu; with the Tap split) |
 
 ## Known limits and open items
 
