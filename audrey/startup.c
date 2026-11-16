@@ -6,6 +6,7 @@
 
 #include "boot_layout.h"
 #include "stm32h7xx.h"
+#include "sw2_hold.h"
 
 // libDaisy's start-up file, unchanged: the full vector table (g_pfnVectors, in
 // .isr_vector, in RAM) and its reset handler, which clears .bss, calls SystemInit,
@@ -82,23 +83,14 @@ static BOOT_TEXT void Sw2Deinit()
     RCC->AHB4ENR &= ~RCC_AHB4ENR_GPIOCEN;
 }
 
-typedef enum
-{
-    kSw2Glitch, // seen down at the first read only: a normal start
-    kSw2Tapped, // held, then let go before AUDREY_TAP_HOLD_MS
-    kSw2Held,   // still down after AUDREY_TAP_HOLD_MS
-} Sw2Hold;
-
 #define BOOT_CLOCK_HZ 64000000u // HSI at reset, HSIDIV 1
 #define BOOT_CYCLES_PER_MS (BOOT_CLOCK_HZ / 1000u)
-// Up for this long counts as let go (contact bounce is shorter)
-#define SW2_RELEASE_MS 20u
-// Down for at least this long counts as a tap (a glitch at the first read doesn't)
-#define SW2_MIN_TAP_MS 50u
+_Static_assert(AUDREY_TAP_HOLD_MS + SW2_RELEASE_MS < 0xFFFFFFFFu / BOOT_CYCLES_PER_MS,
+               "the hold must fit in the 32-bit cycle counter");
 
-// SW2 was down at the first read: how long it stays down, timed with the DWT cycle
-// counter at the reset clock (no tick runs yet), as StartHse in board.cpp does.
-// Returns after SW2_RELEASE_MS of SW2 up, or once it is still down at
+// SW2 was down at the first read: what the hold means (sw2_hold.h), timed with the
+// DWT cycle counter at the reset clock (no tick runs yet), as StartHse in board.cpp
+// does. Returns after SW2_RELEASE_MS of SW2 up, or as soon as it is still down at
 // AUDREY_TAP_HOLD_MS. Leaves the DWT and its trace enable as it found them.
 static BOOT_TEXT Sw2Hold Sw2TimeHold()
 {
@@ -109,40 +101,14 @@ static BOOT_TEXT Sw2Hold Sw2TimeHold()
     DWT->CYCCNT          = 0;
     DWT->CTRL            = ctrl | DWT_CTRL_CYCCNTENA_Msk;
 
-    const uint32_t hold    = AUDREY_TAP_HOLD_MS * BOOT_CYCLES_PER_MS;
-    const uint32_t release = SW2_RELEASE_MS * BOOT_CYCLES_PER_MS;
-    uint32_t       last_down = 0;
-    uint32_t       up_since  = 0;
-    int            up        = 0;
-    Sw2Hold        result;
-    for(;;)
-    {
-        const uint32_t now = DWT->CYCCNT;
-        if(Sw2Down())
-        {
-            up        = 0;
-            last_down = now;
-            if(now >= hold)
-            {
-                result = kSw2Held;
-                break;
-            }
-        }
-        else
-        {
-            if(!up)
-            {
-                up       = 1;
-                up_since = now;
-            }
-            if(now - up_since >= release)
-            {
-                result = last_down >= SW2_MIN_TAP_MS * BOOT_CYCLES_PER_MS ? kSw2Tapped
-                                                                           : kSw2Glitch;
-                break;
-            }
-        }
-    }
+    Sw2Timer t;
+    t.last_down = 0;
+    t.up_since  = 0;
+    t.up        = 0;
+    Sw2Hold result;
+    do
+        result = Sw2Step(&t, Sw2Down(), DWT->CYCCNT, BOOT_CYCLES_PER_MS);
+    while(result == kSw2Pending);
 
     DWT->CTRL        = ctrl;
     CoreDebug->DEMCR = demcr;
@@ -188,15 +154,16 @@ BOOT_TEXT __attribute__((noreturn, used)) void BootFlow()
     const int     sw2  = Sw2Down();
     const int     boot = request == AUDREY_BOOT_REQUEST_MAGIC || !AppValid();
     Sw2Hold       hold = kSw2Glitch;
-    // Tap held at power-on, with an app to start: let go before 3 s, the app starts
-    // and flips its auto-sleep setting; held 3 s, bootloader mode
+    // Tap held at power-on, with an app to start: let go before 5 s, bootloader mode;
+    // still held at 5 s, the app starts at once, Tap still down, and flips its
+    // auto-sleep setting (its start-up heartbeat shows the new one)
     if(sw2 && !boot)
         hold = Sw2TimeHold();
     Sw2Deinit();
 
-    if(boot || hold == kSw2Held)
+    if(boot || hold == kSw2Bootloader)
         RunFromRam();
-    if(hold == kSw2Tapped)
+    if(hold == kSw2Flip)
         *TapFlag() = AUDREY_TAP_FLAG_MAGIC;
     __DSB();
     JumpToApp();

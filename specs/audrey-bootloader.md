@@ -12,7 +12,7 @@ Sibling project: `../_Audrey_/Audrey-III` (paths below starting with `src/` or `
 | # | Requirement |
 |---|---|
 | R1 | Runs on the STM32H743VIT6 integrated board and programs the app into internal flash. |
-| R2 | Holding **SW2** (Tap, PC3) at power-on for **3 s** enters the bootloader. Let go earlier, and the app starts and is told Tap was tapped (it flips its auto-sleep setting). |
+| R2 | Holding **SW2** (Tap, PC3) at power-on and letting go within **5 s** enters the bootloader. Still held at 5 s, the app starts at that moment, with SW2 still down, and is told to flip its auto-sleep setting (Roey, 16 Nov 2026; swapped from the first split, where a short hold flipped and 3 s entered the bootloader). |
 | R3 | Holding **SW1** for 3 s in the running app also enters the bootloader. |
 | R4 | Once entered, the bootloader stays until an upload finishes or power is removed. There is no timeout. |
 | R5 | Otherwise a valid app starts with no visible delay. With no valid app, the bootloader stays active. |
@@ -46,13 +46,13 @@ Bank 1 of the 2 MB flash; sectors are 128 KB.
 | Sectors 1-7 | `0x08020000` | 896 KB | App (currently ~142 KB) |
 | Bank 2 | `0x08100000` | 1 MB | Unused |
 | DTCM word | `0x2001FFF0` | 4 B | Boot request, above the app's `_estack` (`0x2001FFE0`) |
-| DTCM word | `0x2001FFF4` | 4 B | Tap flag (`AUDREY_TAP_FLAG_MAGIC` `0x7A9F11B5`): Tap tapped at power-on |
+| DTCM word | `0x2001FFF4` | 4 B | Tap flag (`AUDREY_TAP_FLAG_MAGIC` `0x7A9F11B5`): Tap held 5 s at power-on |
 
 The boot request word survives a system reset and isn't cleared by either start-up. It follows the
 same convention as `rom_request`: a power cycle leaves a random value, with a 1 in 2^32 chance of a
 false match.
 
-The tap flag is written by the boot flow on every start of the app: the magic after a short Tap hold,
+The tap flag is written by the boot flow on every start of the app: the magic after a 5 s Tap hold,
 0 otherwise. The app reads it and clears it at start-up. Both words are above both stacks (a full
 descending stack's first push goes to `0x2001FFDC`) and outside `.data` and `.bss`, so neither start-up
 touches them. The app keeps its auto-sleep setting in bank 2 (`0x08100000`), not here.
@@ -72,17 +72,21 @@ Reset_Handler
   if request valid, or app invalid -> bootloader mode
   if SW2 low (Tap held):
     time the hold (DWT cycle counter at the 64 MHz reset clock)
-    still held at 3 s -> bootloader mode
-    let go (up for 20 ms) after at least 50 ms down -> tap flag = magic
+    still held at 5 s -> tap flag = magic, and on to the app at once
+    let go (up for 20 ms) after at least 50 ms down -> bootloader mode
     let go sooner (a glitch at the first read) -> nothing
   restore GPIOC to its reset state, then jump to the app
 ```
 
 - **Tap split:** a start without Tap reads SW2 once, after the same 10 ms as before, so it gets no added
-  delay. Holding Tap adds the hold time, up to 3 s. SW2 counts as let go after 20 ms up, so contact
-  bounce during the hold isn't a release. A tap needs 50 ms down, so a single low read doesn't flip the
-  app's setting. The DWT and its trace enable are left as they were found. The 3 s run on the HSI
-  (64 MHz, about 1 %).
+  delay. Holding Tap adds the hold time, up to 5 s: the app starts the moment 5 s is reached, while Tap
+  is still held, so its start-up heartbeat shows the new setting as feedback (the app ignores that hold
+  until Tap is let go, Audrey-III `specs/ui/controls.md`). SW2 counts as let go after 20 ms up, so
+  contact bounce during the hold isn't a release. A press needs 50 ms down, so a single low read is a
+  normal start, not update mode. The DWT and its trace enable are left as they were found. The 5 s run
+  on the HSI (64 MHz, about 1 %).
+- **Hold decision:** `Sw2Step()` in `audrey/sw2_hold.h`, one reading at a time (glitch, bootloader or
+  flip), always inlined into the flash-resident `Sw2TimeHold`. Host test: `make -C audrey/tests`.
 - **No valid app:** bootloader mode at once, with or without Tap, as before.
 
 - **USB clock check:** this is the check from `src/hw/core/startup_core.c`. It is needed because
@@ -270,7 +274,9 @@ HAL, CMSIS device and USB middleware commits, and the stock submodules need
 audrey/
   Makefile           -DSTM32H743xx, USBD_DFU_VENDOR_EXIT_ENABLED=1, no FatFS
   boot_linker.lds    128 KB flash, code in AXI SRAM, .sram1_bss for the LED DMA buffer
-  boot_layout.h      App region, boot request word, tap flag
+  boot_layout.h      App region, boot request word, tap flag, Tap hold time
+  sw2_hold.h         The Tap hold decision (Sw2Step), shared with the host test
+  tests/             Host test of the hold decision: make -C audrey/tests
   startup.c          Flash vectors and the boot flow above; includes libDaisy's start-up file for RAM
   main.cpp           Clocks, USB, main loop
   dfu_flash.cpp/.h   DFU backend
@@ -286,7 +292,7 @@ shared/usbd_desc.c   Reused as it is (Synthux / Audrey III)
 # First time, or recovery: hold SW1 at power-on (ROM DFU). In Audrey-III:
 make BOARD=integrated program-boot
 
-# App: bootloader mode (SW2 held 3 s at power-on, or SW1 for 3 s in the app). In Audrey-III:
+# App: bootloader mode (SW2 held at power-on and let go within 5 s, or SW1 for 3 s in the app). In Audrey-III:
 make BOARD=integrated program-dfu
 
 # With an ST-Link: the bootloader, in audrey/
@@ -307,9 +313,10 @@ LEDs weren't observed.
 |---|---|---|---|
 | T1 | Blank app region, power on | Bootloader mode, idle glow | Partial: stays in bootloader; glow not observed |
 | T2 | Valid app, power on | App starts, with no glow | Partial: app starts after reset; no power cycle, glow not observed |
-| T3 | SW2 held at power-on for 4 s | Idle glow; still running after 10 minutes | Not run |
-| T3a | SW2 held at power-on, let go after about 1 s | App starts; its start-up heartbeat shows the flipped auto-sleep setting (Audrey-III `specs/auto-sleep.md` 1.15) | Not run |
-| T3b | Power on without SW2, ten times | App starts with no delay; setting unchanged | Not run |
+| T3 | SW2 held at power-on, let go after about 1 s, and again after about 4 s | Idle glow; still running after 10 minutes (Audrey-III `specs/auto-sleep.md` 1.15) | Not run |
+| T3a | SW2 held at power-on and kept held | After about 5 s the app starts, SW2 still held; its start-up heartbeat shows the flipped auto-sleep setting, and the held Tap does nothing in the app (1.16) | Not run |
+| T3b | Power on without SW2, ten times | App starts with no delay; setting unchanged (1.17) | Not run |
+| T3c | Hold decision on the host (`make -C audrey/tests`) | Glitch below 50 ms, bootloader from 50 ms to 5 s, flip at 5 s; bounce under 20 ms isn't a release | Pass (16 Nov 2026) |
 | T4 | SW1 held 3 s in app, then released | Idle glow after release | Partial: request word plus reset enters the bootloader; button not pressed |
 | T5 | SW1 held at power-on | ROM DFU appears | Not run |
 | T6 | Upload the app with `dfu-util` 0.11 | Plate 6 during erase, smooth fill to all six, app starts | Partial: 6 of 6 uploads verified and started; LEDs not observed |
@@ -320,7 +327,7 @@ LEDs weren't observed.
 | T11 | Upload without `:leave`, then power cycle | Bootloader mode | Partial: reset rather than power cycle; vectors stay blank |
 | T12 | Upload an image over 512 KB (3+ sector erases queued) | No USB stall or `dfu-util` error | Pass: 612 KB, 10 s (142 KB takes 3 s) |
 | T13 | Enter from a running app with the ring lit | Ring goes dark | Not run |
-| T14 | Build bootloader | Under 128 KB | Pass: 72,452 B (16 Nov 2026, GCC 13.2.1 Ubuntu; with the Tap split) |
+| T14 | Build bootloader | Under 128 KB | Pass: 69,444 B (16 Nov 2026, the Mac's ARM GCC 10.3-2021.10, with the 5 s Tap hold; 72,452 B with GCC 13.2.1 for the first split) |
 
 ## Known limits and open items
 
