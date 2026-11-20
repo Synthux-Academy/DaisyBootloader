@@ -1,5 +1,11 @@
 # Audrey bootloader
 
+> **This branch is no longer used (18 Nov 2026).** Roey decided Tap at power-on is for firmware
+> installs only, so Audrey III uses Vlad's bootloader from `audrey-iii` (fbceadf) unchanged again,
+> and auto-sleep is flipped with the right-most plate held at switch-on (Audrey-III branch
+> `auto-sleep`, `specs/auto-sleep.md`). The timed Tap hold below (R2, `sw2_hold.h`, the tap flag at
+> `0x2001FFF4`) should not be merged.
+
 USB DFU bootloader for the Audrey integrated board (STM32H743VIT6), in [audrey/](../audrey). It is
 based on this repo's Daisy bootloader and takes over from the Daisy-only `bootloader.bin` in
 Audrey-III for that project's integrated build. See [Test status](#acceptance-tests) for what has been
