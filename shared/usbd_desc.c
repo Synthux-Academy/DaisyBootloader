@@ -88,6 +88,23 @@
 
 /* USER CODE BEGIN PRIVATE_DEFINES */
 
+/* Windows (Audrey build only, USBD_CLASS_BOS_ENABLED=1 in audrey/Makefile): USB 2.01
+   with a BOS descriptor that points to Microsoft OS 2.0 descriptors. Windows 8.1 and
+   later then install WinUSB for update mode by themselves, so Chrome's WebUSB can
+   update Audrey with no Zadig step. Its own release number (3.00), so Windows doesn't
+   reuse what it learned about another 0483:DF11 device such as ST's ROM loader.
+   See ../specs/audrey-bootloader.md, "Windows". */
+#if (USBD_CLASS_BOS_ENABLED == 1)
+#define USBD_BCDUSB_LO       0x01 /* bcdUSB 2.01 */
+#define USBD_BCDDEVICE_HI    0x03 /* bcdDevice 3.00 */
+#define MS_OS_20_VENDOR_CODE 0x20 /* bRequest of Windows' vendor request */
+#define MS_OS_20_SET_LEN     0xA2 /* 10 header + 20 compatible ID + 132 registry */
+#define MS_OS_20_DESCRIPTOR_INDEX 0x07
+#else
+#define USBD_BCDUSB_LO       0x00 /* bcdUSB 2.00 */
+#define USBD_BCDDEVICE_HI    0x02 /* bcdDevice 2.00 */
+#endif
+
 /* USER CODE END PRIVATE_DEFINES */
 
 /**
@@ -135,6 +152,10 @@ uint8_t * USBD_FS_ProductStrDescriptor(USBD_SpeedTypeDef speed, uint16_t *length
 uint8_t * USBD_FS_SerialStrDescriptor(USBD_SpeedTypeDef speed, uint16_t *length);
 uint8_t * USBD_FS_ConfigStrDescriptor(USBD_SpeedTypeDef speed, uint16_t *length);
 uint8_t * USBD_FS_InterfaceStrDescriptor(USBD_SpeedTypeDef speed, uint16_t *length);
+#if (USBD_CLASS_BOS_ENABLED == 1)
+uint8_t * USBD_BOSDescriptor(USBD_SpeedTypeDef speed, uint16_t *length);
+uint8_t * USBD_MsOs20Descriptor(uint8_t vendor_code, uint16_t index, uint16_t *length);
+#endif
 
 /**
   * @}
@@ -154,6 +175,9 @@ USBD_DescriptorsTypeDef FS_Desc =
 , USBD_FS_SerialStrDescriptor
 , USBD_FS_ConfigStrDescriptor
 , USBD_FS_InterfaceStrDescriptor
+#if (USBD_CLASS_BOS_ENABLED == 1)
+, USBD_BOSDescriptor
+#endif
 };
 
 #if defined ( __ICCARM__ ) /* IAR Compiler */
@@ -164,7 +188,7 @@ __ALIGN_BEGIN uint8_t USBD_FS_DeviceDesc[USB_LEN_DEV_DESC] __ALIGN_END =
 {
   0x12,                       /*bLength */
   USB_DESC_TYPE_DEVICE,       /*bDescriptorType*/
-  0x00,                       /*bcdUSB */
+  USBD_BCDUSB_LO,             /*bcdUSB 2.00, or 2.01 with the BOS descriptor */
   0x02,
   0x00,                       /*bDeviceClass*/
   0x00,                       /*bDeviceSubClass*/
@@ -174,8 +198,8 @@ __ALIGN_BEGIN uint8_t USBD_FS_DeviceDesc[USB_LEN_DEV_DESC] __ALIGN_END =
   HIBYTE(USBD_VID),           /*idVendor*/
   LOBYTE(USBD_PID_FS),        /*idProduct*/
   HIBYTE(USBD_PID_FS),        /*idProduct*/
-  0x00,                       /*bcdDevice rel. 2.00*/
-  0x02,
+  0x00,                       /*bcdDevice rel. 2.00, or 3.00 with the BOS descriptor */
+  USBD_BCDDEVICE_HI,
   USBD_IDX_MFC_STR,           /*Index of manufacturer  string*/
   USBD_IDX_PRODUCT_STR,       /*Index of product string*/
   USBD_IDX_SERIAL_STR,        /*Index of serial number string*/
@@ -213,6 +237,9 @@ USBD_DescriptorsTypeDef HS_Desc =
 , USBD_HS_SerialStrDescriptor
 , USBD_HS_ConfigStrDescriptor
 , USBD_HS_InterfaceStrDescriptor
+#if (USBD_CLASS_BOS_ENABLED == 1)
+, USBD_BOSDescriptor
+#endif
 };
 
 #if defined ( __ICCARM__ ) /* IAR Compiler */
@@ -223,7 +250,7 @@ __ALIGN_BEGIN uint8_t USBD_HS_DeviceDesc[USB_LEN_DEV_DESC] __ALIGN_END =
 {
   0x12,                       /*bLength */
   USB_DESC_TYPE_DEVICE,       /*bDescriptorType*/
-  0x00,                       /*bcdUSB */
+  USBD_BCDUSB_LO,             /*bcdUSB 2.00, or 2.01 with the BOS descriptor */
 
   0x02,
   0x00,                       /*bDeviceClass*/
@@ -234,8 +261,8 @@ __ALIGN_BEGIN uint8_t USBD_HS_DeviceDesc[USB_LEN_DEV_DESC] __ALIGN_END =
   HIBYTE(USBD_VID),           /*idVendor*/
   LOBYTE(USBD_PID_HS),        /*idProduct*/
   HIBYTE(USBD_PID_HS),        /*idProduct*/
-  0x00,                       /*bcdDevice rel. 2.00*/
-  0x02,
+  0x00,                       /*bcdDevice rel. 2.00, or 3.00 with the BOS descriptor */
+  USBD_BCDDEVICE_HI,
   USBD_IDX_MFC_STR,           /*Index of manufacturer  string*/
   USBD_IDX_PRODUCT_STR,       /*Index of product string*/
   USBD_IDX_SERIAL_STR,        /*Index of serial number string*/
@@ -279,6 +306,61 @@ __ALIGN_BEGIN uint8_t USBD_StringSerial[USB_SIZ_STRING_SERIAL] __ALIGN_END = {
   USB_SIZ_STRING_SERIAL,
   USB_DESC_TYPE_STRING,
 };
+
+#if (USBD_CLASS_BOS_ENABLED == 1)
+/* BOS descriptor: one platform capability, Microsoft OS 2.0. It tells Windows the
+   size of the descriptor set and which vendor request returns it. */
+__ALIGN_BEGIN static uint8_t USBD_BOSDesc[0x21] __ALIGN_END =
+{
+  0x05,                       /* bLength */
+  USB_DESC_TYPE_BOS,          /* bDescriptorType */
+  0x21, 0x00,                 /* wTotalLength: 5 + 28 */
+  0x01,                       /* bNumDeviceCaps */
+
+  0x1C,                       /* bLength */
+  0x10,                       /* bDescriptorType: device capability */
+  0x05,                       /* bDevCapabilityType: platform */
+  0x00,                       /* bReserved */
+  0xDF, 0x60, 0xDD, 0xD8, 0x89, 0x45, 0xC7, 0x4C, /* PlatformCapabilityUUID, */
+  0x9C, 0xD2, 0x65, 0x9D, 0x9E, 0x64, 0x8A, 0x9F, /* {D8DD60DF-4589-4CC7-9CD2-659D9E648A9F} */
+  0x00, 0x00, 0x03, 0x06,     /* dwWindowsVersion: Windows 8.1 (0x06030000) */
+  LOBYTE(MS_OS_20_SET_LEN), HIBYTE(MS_OS_20_SET_LEN), /* wMSOSDescriptorSetTotalLength */
+  MS_OS_20_VENDOR_CODE,       /* bMS_VendorCode */
+  0x00                        /* bAltEnumCode: none */
+};
+
+/* Microsoft OS 2.0 descriptor set, for the whole device (it has one interface):
+   use WinUSB, and register a device interface GUID so programs such as Chrome can
+   open it. The GUID is Audrey's own and must never change. */
+__ALIGN_BEGIN static uint8_t USBD_MsOs20Set[MS_OS_20_SET_LEN] __ALIGN_END =
+{
+  /* Set header */
+  0x0A, 0x00,                 /* wLength */
+  0x00, 0x00,                 /* wDescriptorType: MS_OS_20_SET_HEADER_DESCRIPTOR */
+  0x00, 0x00, 0x03, 0x06,     /* dwWindowsVersion: Windows 8.1 */
+  LOBYTE(MS_OS_20_SET_LEN), HIBYTE(MS_OS_20_SET_LEN), /* wTotalLength */
+
+  /* Compatible ID: WINUSB */
+  0x14, 0x00,                 /* wLength */
+  0x03, 0x00,                 /* wDescriptorType: MS_OS_20_FEATURE_COMPATBLE_ID */
+  'W', 'I', 'N', 'U', 'S', 'B', 0x00, 0x00,       /* CompatibleID */
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* SubCompatibleID */
+
+  /* Registry property: DeviceInterfaceGUIDs (REG_MULTI_SZ) */
+  0x84, 0x00,                 /* wLength: 132 */
+  0x04, 0x00,                 /* wDescriptorType: MS_OS_20_FEATURE_REG_PROPERTY */
+  0x07, 0x00,                 /* wPropertyDataType: REG_MULTI_SZ */
+  0x2A, 0x00,                 /* wPropertyNameLength: 42 */
+  'D', 0, 'e', 0, 'v', 0, 'i', 0, 'c', 0, 'e', 0, 'I', 0, 'n', 0, 't', 0, 'e', 0,
+  'r', 0, 'f', 0, 'a', 0, 'c', 0, 'e', 0, 'G', 0, 'U', 0, 'I', 0, 'D', 0, 's', 0,
+  0, 0,
+  0x50, 0x00,                 /* wPropertyDataLength: 80 */
+  '{', 0, 'E', 0, 'D', 0, '8', 0, '1', 0, '1', 0, 'D', 0, '0', 0, '7', 0, '-', 0,
+  '8', 0, '8', 0, 'C', 0, '0', 0, '-', 0, '4', 0, '3', 0, '6', 0, '9', 0, '-', 0,
+  '8', 0, 'E', 0, 'F', 0, 'C', 0, '-', 0, '6', 0, 'A', 0, '2', 0, '7', 0, '3', 0,
+  'C', 0, '0', 0, '0', 0, '3', 0, 'A', 0, '5', 0, '5', 0, '}', 0, 0, 0, 0, 0
+};
+#endif /* USBD_CLASS_BOS_ENABLED */
 
 /**
   * @}
@@ -521,6 +603,40 @@ uint8_t * USBD_HS_InterfaceStrDescriptor(USBD_SpeedTypeDef speed, uint16_t *leng
   }
   return USBD_StrDesc;
 }
+
+#if (USBD_CLASS_BOS_ENABLED == 1)
+/**
+  * @brief  Return the BOS descriptor (Microsoft OS 2.0 platform capability)
+  * @param  speed : Current device speed
+  * @param  length : Pointer to data length variable
+  * @retval Pointer to descriptor buffer
+  */
+uint8_t * USBD_BOSDescriptor(USBD_SpeedTypeDef speed, uint16_t *length)
+{
+  UNUSED(speed);
+  *length = sizeof(USBD_BOSDesc);
+  return USBD_BOSDesc;
+}
+
+/**
+  * @brief  The Microsoft OS 2.0 descriptor set, for Windows' vendor request
+  *         (bmRequestType 0xC0, bRequest MS_OS_20_VENDOR_CODE, wIndex 7)
+  * @param  vendor_code : bRequest of the request
+  * @param  index : wIndex of the request
+  * @param  length : Pointer to data length variable
+  * @retval Pointer to the set, or NULL when the request is not this one
+  */
+uint8_t * USBD_MsOs20Descriptor(uint8_t vendor_code, uint16_t index, uint16_t *length)
+{
+  if (vendor_code != MS_OS_20_VENDOR_CODE || index != MS_OS_20_DESCRIPTOR_INDEX)
+  {
+    *length = 0U;
+    return NULL;
+  }
+  *length = sizeof(USBD_MsOs20Set);
+  return USBD_MsOs20Set;
+}
+#endif /* USBD_CLASS_BOS_ENABLED */
 
 /**
   * @brief  Create the serial number string descriptor

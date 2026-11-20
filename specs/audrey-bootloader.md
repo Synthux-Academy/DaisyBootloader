@@ -20,6 +20,7 @@ Sibling project: `../_Audrey_/Audrey-III` (paths below starting with `src/` or `
 | R7 | Upload: the same LEDs show progress, from the `kTapPadDucking` plate (0%, erase) to the `kTapPadBodyTrack` plate (100%). |
 | R8 | The bootloader can't overwrite itself, and an interrupted upload never starts as if complete. |
 | R9 | Holding SW1 at power-on still starts ST's ROM DFU, as the recovery path. |
+| R10 | Windows 8.1 and later install WinUSB for update mode by themselves, so Chrome can update Audrey with no Zadig step (Roey, 20 Nov 2026: owners update from the manual, synthux.academy/audrey/manual). See [Windows](#windows). |
 
 Out of scope: SD and USB-stick loading (the board has neither), audio, multi-image support, and any
 change to the Audrey-III Daisy build.
@@ -246,6 +247,35 @@ HAL, CMSIS device and USB middleware commits, and the stock submodules need
 `libdaisy.a` stays built for STM32H750 (same die and register map), as the app's does today, with
 `-DSTM32H743xx` for the bootloader's own files. The stock `bootloader/` target still builds.
 
+## Windows
+
+On Windows, Chrome's WebUSB can only open a device that uses the WinUSB driver. Without help, a
+board in update mode gets no driver, and the user must install one with Zadig: fine for the factory
+PC, not for owners. So the bootloader describes itself to Windows with Microsoft OS 2.0
+descriptors, and Windows installs WinUSB on its own the first time it sees the board in update mode.
+
+- **Device descriptor**: bcdUSB 2.01 (Windows then asks for the BOS descriptor) and bcdDevice 3.00,
+  its own release number, so Windows doesn't reuse what it learned about another `0483:DF11` device
+  such as ST's ROM loader.
+- **BOS descriptor** (33 bytes): one platform capability, Microsoft OS 2.0
+  (`{D8DD60DF-4589-4CC7-9CD2-659D9E648A9F}`, Windows 8.1), naming the set's length (162 bytes) and
+  vendor code 0x20.
+- **Descriptor set**, for the whole device (it has one interface): compatible ID `WINUSB`, and the
+  registry property `DeviceInterfaceGUIDs` = `{ED811D07-88C0-4369-8EFC-6A273C003A55}`, Audrey's own.
+  Never change the GUID.
+- **Where**: the descriptors are in `shared/usbd_desc.c`, on only when `USBD_CLASS_BOS_ENABLED=1`
+  (set in `audrey/Makefile`; the stock `bootloader/` build is byte-identical without it).
+  `DfuSetup` in `dfu_flash.cpp` answers the vendor request (`C0 20 0000 0007`), also before the
+  device is configured, which is when Windows asks; any other vendor request stalls, as before.
+  libdaisy.a's `usbd_ctlreq.c` doesn't answer the BOS request, so `audrey/Makefile` builds it again
+  with the switch on, and the linker takes that copy.
+- **Bench check without Windows**: `make -C audrey/tests probe` with a board in update mode reads
+  the descriptors the way Windows does (libusb, Mac or Linux).
+- **Limits**: ST's ROM loader (R9) has no such descriptors, so installing the bootloader itself (the
+  factory, or a recovery) still needs Zadig on Windows. A PC where ST's own DFU driver already claims
+  `0483:DF11` (people with ST's programming tools) may keep that driver; the manual then shows the
+  Zadig steps.
+
 ## Files
 
 ```text
@@ -253,13 +283,14 @@ audrey/
   Makefile           -DSTM32H743xx, USBD_DFU_VENDOR_EXIT_ENABLED=1, no FatFS
   boot_linker.lds    128 KB flash, code in AXI SRAM, .sram1_bss for the LED DMA buffer
   boot_layout.h      App region and boot request word
+  tests/             Bench probe of the Windows descriptors (make -C audrey/tests probe)
   startup.c          Flash vectors and the boot flow above; includes libDaisy's start-up file for RAM
   main.cpp           Clocks, USB, main loop
   dfu_flash.cpp/.h   DFU backend
   led_status.cpp/.h  LED states
   board.cpp/.h       Pins, clock fallback, no-VBUS USB and CRS, copied from Audrey-III
   ws2812.cpp/.h      Copied driver, with its own TIM3 handle
-shared/usbd_desc.c   Reused as it is (Synthux / Audrey III)
+shared/usbd_desc.c   Synthux / Audrey III, plus the Windows descriptors when USBD_CLASS_BOS_ENABLED=1
 ```
 
 ## Flashing
@@ -300,7 +331,9 @@ LEDs weren't observed.
 | T11 | Upload without `:leave`, then power cycle | Bootloader mode | Partial: reset rather than power cycle; vectors stay blank |
 | T12 | Upload an image over 512 KB (3+ sector erases queued) | No USB stall or `dfu-util` error | Pass: 612 KB, 10 s (142 KB takes 3 s) |
 | T13 | Enter from a running app with the ring lit | Ring goes dark | Not run |
-| T14 | Build bootloader | Under 128 KB | Pass: 70 KB |
+| T14 | Build bootloader | Under 128 KB | Pass: 69,524 B with the Windows descriptors, 69,144 B for the same commit without them (20 Nov 2026, the Mac's ARM GCC 10.3-2021.10). Vlad's saved binary of that commit is 70,740 B, from another compiler |
+| T15 | `make -C audrey/tests probe`, board in update mode (Mac) | PASS: bcdUSB 2.01, bcdDevice 3.00, BOS, the 162-byte set with WINUSB and the GUID, other vendor requests stall | Not run |
+| T16 | Windows PC that never had Zadig: board in update mode, Chrome | Device Manager lists it under Universal Serial Bus devices with WinUSB; Chrome's device chooser lists "Audrey III"; an install through it completes | Not run |
 
 ## Known limits and open items
 

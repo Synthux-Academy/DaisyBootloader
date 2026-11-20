@@ -17,15 +17,22 @@ FLASH_ADDRESS = 0x08000000
 
 CPP_SOURCES = main.cpp board.cpp dfu_flash.cpp led_status.cpp ws2812.cpp
 
+# usbd_ctlreq.c is libdaisy.a's request handler, built here again with the BOS
+# descriptor on (see C_DEFS); ours replaces the library's copy at link time.
 C_SOURCES = startup.c \
 	../shared/usbd_desc.c \
-	$(LIBDAISY_DIR)/Middlewares/ST/STM32_USB_Device_Library/Class/DFU/Src/usbd_dfu.c
+	$(LIBDAISY_DIR)/Middlewares/ST/STM32_USB_Device_Library/Class/DFU/Src/usbd_dfu.c \
+	$(LIBDAISY_DIR)/Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_ctlreq.c
 
 C_INCLUDES = -I. -I../shared \
 	-I$(LIBDAISY_DIR)/Middlewares/ST/STM32_USB_Device_Library/Class/DFU/Inc
 
-# Sent to the DFU class: our LeaveDFU commits the image instead of a direct reset
-C_DEFS = -DUSBD_DFU_VENDOR_EXIT_ENABLED=1 -DUSBD_DFU_APP_DEFAULT_ADD=0x90040000U
+# Sent to the DFU class: our LeaveDFU commits the image instead of a direct reset.
+# USBD_CLASS_BOS_ENABLED: USB 2.01 with Microsoft OS 2.0 descriptors, so Windows
+# installs WinUSB for update mode by itself and Chrome can update Audrey without
+# Zadig (../specs/audrey-bootloader.md, "Windows").
+C_DEFS = -DUSBD_DFU_VENDOR_EXIT_ENABLED=1 -DUSBD_DFU_APP_DEFAULT_ADD=0x90040000U \
+	-DUSBD_CLASS_BOS_ENABLED=1
 
 # Bare-metal: there is no loader enforcing W^X on ELF program headers
 ifneq ($(shell arm-none-eabi-ld --help 2>/dev/null | grep -c no-warn-rwx-segments),0)

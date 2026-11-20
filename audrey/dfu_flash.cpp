@@ -17,6 +17,10 @@ extern "C"
 {
     extern USBD_HandleTypeDef hUsbDeviceFS;
     extern PCD_HandleTypeDef  hpcd_USB_OTG_FS;
+#if(USBD_CLASS_BOS_ENABLED == 1)
+    // ../shared/usbd_desc.c: the Microsoft OS 2.0 set, or null for another request
+    uint8_t* USBD_MsOs20Descriptor(uint8_t vendor_code, uint16_t index, uint16_t* length);
+#endif
 }
 
 namespace
@@ -401,6 +405,23 @@ uint8_t           busy_status[6];
 // done, and the host waits exactly as long as the flash takes.
 uint8_t DfuSetup(USBD_HandleTypeDef* pdev, USBD_SetupReqTypedef* req)
 {
+#if(USBD_CLASS_BOS_ENABLED == 1)
+    // Windows reads the Microsoft OS 2.0 set with a vendor request named in the BOS
+    // descriptor, then installs WinUSB by itself (../specs/audrey-bootloader.md,
+    // "Windows"). The DFU class has no vendor requests, so any other one stalls.
+    if((req->bmRequest & USB_REQ_TYPE_MASK) == USB_REQ_TYPE_VENDOR)
+    {
+        uint16_t len = 0;
+        uint8_t* set = USBD_MsOs20Descriptor(req->bRequest, req->wIndex, &len);
+        if(set == nullptr || (req->bmRequest & 0x80U) == 0U)
+        {
+            USBD_CtlError(pdev, req);
+            return USBD_FAIL;
+        }
+        USBD_CtlSendData(pdev, set, req->wLength < len ? req->wLength : len);
+        return USBD_OK;
+    }
+#endif
     const auto* hdfu
         = static_cast<USBD_DFU_HandleTypeDef*>(pdev->pClassDataCmsit[pdev->classId]);
     const bool status_request = (req->bmRequest & USB_REQ_TYPE_MASK) == USB_REQ_TYPE_CLASS
